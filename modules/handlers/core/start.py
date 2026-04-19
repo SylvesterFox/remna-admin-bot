@@ -1,12 +1,11 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from modules.config import (
-    MAIN_MENU, DASHBOARD_SHOW_SYSTEM_STATS, DASHBOARD_SHOW_SERVER_INFO,
+    MAIN_MENU, SELF_SERVICE_MENU, DASHBOARD_SHOW_SYSTEM_STATS, DASHBOARD_SHOW_SERVER_INFO,
     DASHBOARD_SHOW_USERS_COUNT, DASHBOARD_SHOW_NODES_COUNT, 
     DASHBOARD_SHOW_TRAFFIC_STATS, DASHBOARD_SHOW_UPTIME
 )
 from modules.utils.auth import (
-    check_operator_or_admin,
     get_user_role,
     is_admin_user
 )
@@ -14,6 +13,7 @@ from modules.api.users import UserAPI
 from modules.api.nodes import NodeAPI
 from modules.api.inbounds import InboundAPI
 from modules.handlers.core.language import LANGUAGE_MENU_CALLBACK
+from modules.handlers.self_service import show_self_service_menu, get_linked_user
 from modules.localization import SUPPORTED_LANGUAGES, get_user_language
 from modules.utils.formatters import format_bytes
 import logging
@@ -22,10 +22,26 @@ logger = logging.getLogger(__name__)
 
 ROLE_DISPLAY = {"admin": "Администратор", "operator": "Оператор"}
 
-@check_operator_or_admin
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
-    await show_main_menu(update, context)
+    user = update.effective_user
+    if not user:
+        return MAIN_MENU
+
+    role = get_user_role(user.id)
+    if role in {"admin", "operator"}:
+        await show_main_menu(update, context)
+        return MAIN_MENU
+
+    linked_user = await get_linked_user(user.id)
+    if linked_user:
+        await show_self_service_menu(update, context)
+        return SELF_SERVICE_MENU
+
+    if update.message:
+        await update.message.reply_text("⛔ Вам недоступен этот бот. Обратитесь к администратору.")
+    elif update.callback_query:
+        await update.callback_query.answer("⛔ Вам недоступен этот бот. Обратитесь к администратору.", show_alert=True)
     return MAIN_MENU
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -380,5 +396,4 @@ async def get_basic_system_stats():
     except Exception as e:
         logger.error(f"Error getting basic system stats: {e}")
         return "📈 *Статистика временно недоступна*\n"
-
 

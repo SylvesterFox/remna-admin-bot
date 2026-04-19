@@ -17,9 +17,11 @@ from modules.config import (
     CREATE_USER, CREATE_USER_FIELD, BULK_CONFIRM, 
     EDIT_NODE, EDIT_NODE_FIELD, EDIT_HOST, EDIT_HOST_FIELD, NODE_PORT,
     CREATE_NODE, NODE_NAME, NODE_ADDRESS, SELECT_INBOUNDS, CREATE_HOST, HOST_PROFILE, HOST_INBOUND, HOST_PARAMS,
+    SELF_SERVICE_MENU,
     ADMIN_USER_IDS
 )
 from modules.utils.auth import check_authorization
+from modules.api.users import UserAPI
 
 from modules.handlers.core.start import start
 from modules.handlers.core.menu import handle_menu_selection
@@ -40,6 +42,7 @@ from modules.handlers.hosts import (
 )
 from modules.handlers.inbounds import handle_inbounds_menu
 from modules.handlers.bulk import handle_bulk_menu, handle_bulk_confirm
+from modules.handlers.self_service import handle_self_service_menu
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,8 @@ async def unauthorized_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     username = update.effective_user.username or "Unknown"
     
     # Проверяем авторизацию
-    if not check_authorization(update.effective_user):
+    linked_user = await UserAPI.get_user_by_telegram_id(update.effective_user.id)
+    if not check_authorization(update.effective_user) and not linked_user:
         logger.warning(f"Unauthorized access attempt from user {user_id} (@{username})")
         
         if update.message:
@@ -65,7 +69,10 @@ async def unauthorized_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 def create_conversation_handler():
     """Create the main conversation handler"""
     return ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(handle_self_service_menu, pattern="^self_"),
+        ],
         states={
             MAIN_MENU: [
                 CallbackQueryHandler(handle_menu_selection)
@@ -96,6 +103,9 @@ def create_conversation_handler():
             ],
             INBOUND_MENU: [
                 CallbackQueryHandler(handle_inbounds_menu)
+            ],
+            SELF_SERVICE_MENU: [
+                CallbackQueryHandler(handle_self_service_menu, pattern="^self_")
             ],
             BULK_MENU: [
                 CallbackQueryHandler(handle_bulk_menu)

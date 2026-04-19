@@ -87,6 +87,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, CallbackQuer
 # Import modules
 from modules.handlers.core.conversation import create_conversation_handler
 from modules import localization  # noqa: F401 - ensure localization patches are loaded
+from modules.services.expiry_notifier import expiry_notifier_loop
 
 
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -113,6 +114,20 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
             update.effective_user.id if update.effective_user else None,
             update.effective_chat.id if update.effective_chat else None,
         )
+
+
+async def post_init(application: Application) -> None:
+    """Start background tasks after bot startup."""
+    application.bot_data["expiry_notifier_task"] = application.create_task(
+        expiry_notifier_loop(application)
+    )
+
+
+async def post_shutdown(application: Application) -> None:
+    """Stop background tasks on shutdown."""
+    task = application.bot_data.pop("expiry_notifier_task", None)
+    if task:
+        task.cancel()
 
 
 def main():
@@ -149,7 +164,13 @@ def main():
         return
     # Create the Application
     logger.info("Creating Telegram Application...")
-    application = Application.builder().token(bot_token).build()
+    application = (
+        Application.builder()
+        .token(bot_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     logger.info("Telegram Application created successfully")
     
     # Cache cleanup will be handled automatically by the cache TTL mechanism
@@ -210,4 +231,3 @@ if __name__ == '__main__':
         pass  # Graceful shutdown
     except Exception as e:
         logger.error(f"Critical error in main: {e}", exc_info=True)
-
