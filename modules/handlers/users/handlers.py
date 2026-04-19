@@ -110,6 +110,7 @@ class Messages:
     CONFIRM_RESET = "⚠️ Вы уверены, что хотите сбросить трафик пользователя?"
     CONFIRM_REVOKE = "⚠️ Вы уверены, что хотите отозвать подписку пользователя?"
 from modules.api.users import UserAPI
+from modules.api.internal_squads import InternalSquadAPI
 from modules.utils.formatters import format_bytes, format_user_details, format_user_details_safe, escape_markdown, safe_edit_message
 from modules.utils.selection_helpers import SelectionHelper
 from modules.utils.auth import (
@@ -187,6 +188,103 @@ async def _send_user_request_keyboard(
     target_message = update.callback_query.message if update.callback_query else update.message
     if target_message:
         await target_message.reply_text(prompt, reply_markup=keyboard)
+
+
+async def _show_internal_squads_selector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Render internal squads multi-select step for user creation."""
+    squads = context.user_data.get("available_internal_squads")
+    if squads is None:
+        squads = await InternalSquadAPI.get_all_internal_squads()
+        context.user_data["available_internal_squads"] = squads
+
+    selected = set(context.user_data["create_user"].get("activeInternalSquads", []))
+
+    keyboard = []
+    if squads:
+        for squad in squads:
+            squad_uuid = squad.get("uuid")
+            squad_name = squad.get("name", "Без имени")
+            if not squad_uuid:
+                continue
+            prefix = "✅" if squad_uuid in selected else "⬜"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{prefix} {squad_name}",
+                    callback_data=f"create_squad_toggle_{squad_uuid}",
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="create_squad_done")])
+    else:
+        keyboard.append([InlineKeyboardButton("⏩ Пропустить", callback_data="skip_field")])
+
+    keyboard.append([InlineKeyboardButton("⏩ Пропустить", callback_data="skip_field")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")])
+
+    message = "🛡️ *Выберите внутренние сквады*\n\n"
+    if squads:
+        message += "Можно выбрать несколько сквадов. Нажимайте по пунктам, затем `Готово`."
+    else:
+        message += "Не удалось получить список внутренних сквадов."
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+
+
+async def _show_edit_internal_squads_selector(update: Update, context: ContextTypes.DEFAULT_TYPE, user: Dict[str, Any]):
+    """Render internal squads multi-select step for editing a user."""
+    squads = context.user_data.get("available_internal_squads")
+    if squads is None:
+        squads = await InternalSquadAPI.get_all_internal_squads()
+        context.user_data["available_internal_squads"] = squads
+
+    selected = set(context.user_data.get("edit_active_internal_squads", []))
+
+    keyboard = []
+    if squads:
+        for squad in squads:
+            squad_uuid = squad.get("uuid")
+            squad_name = squad.get("name", "Без имени")
+            if not squad_uuid:
+                continue
+            prefix = "✅" if squad_uuid in selected else "⬜"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{prefix} {squad_name}",
+                    callback_data=f"edit_squad_toggle_{squad_uuid}",
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="edit_squad_done")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔄 Обновить список", callback_data=f"edit_field_activeInternalSquads")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад к выбору поля", callback_data=f"edit_{user['uuid']}")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"view_{user['uuid']}")])
+
+    message = f"📝 *Редактирование поля: Внутренние сквады*\n\n"
+    if squads:
+        message += "Нажимайте по сквадам, чтобы включать и выключать их для пользователя.\n"
+        message += "Когда закончите, нажмите `Готово`."
+    else:
+        message += "Не удалось получить список внутренних сквадов."
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.edit_message_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
 
 # Декоратор для проверки авторизации
 def require_authorization(func):
@@ -1905,6 +2003,10 @@ async def ask_for_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         return CREATE_USER_FIELD
+
+    elif field == "activeInternalSquads":
+        await _show_internal_squads_selector(update, context)
+        return CREATE_USER_FIELD
     
     # Special handling for trafficLimitBytes
     elif field == "trafficLimitBytes":
@@ -2205,7 +2307,7 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
         
         elif data == "add_optional_fields":
             # Добавляем дополнительные поля
-            optional_fields = ["telegramId", "email", "tag", "expireAt"]
+            optional_fields = ["expireAt", "activeInternalSquads", "telegramId", "email", "tag"]
             current_fields = context.user_data["create_user_fields"]
             # Добавляем поля, которых еще нет
             for field in optional_fields:
@@ -2269,6 +2371,38 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
                         parse_mode="Markdown"
                     )
             
+            return CREATE_USER_FIELD
+
+        elif data.startswith("create_squad_toggle_"):
+            squad_uuid = data.replace("create_squad_toggle_", "", 1)
+            fields = context.user_data["create_user_fields"]
+            index = context.user_data["current_field_index"]
+            field = fields[index]
+
+            if field == "activeInternalSquads":
+                selected = context.user_data["create_user"].get("activeInternalSquads", [])
+                if squad_uuid in selected:
+                    selected = [uuid for uuid in selected if uuid != squad_uuid]
+                else:
+                    selected = [*selected, squad_uuid]
+                context.user_data["create_user"]["activeInternalSquads"] = selected
+                await _show_internal_squads_selector(update, context)
+            return CREATE_USER_FIELD
+
+        elif data == "create_squad_done":
+            fields = context.user_data["create_user_fields"]
+            index = context.user_data["current_field_index"]
+            field = fields[index]
+
+            if field == "activeInternalSquads":
+                selected = context.user_data["create_user"].get("activeInternalSquads", [])
+                readable = f"{len(selected)} шт." if selected else "не выбраны"
+                await query.edit_message_text(
+                    f"✅ Внутренние сквады: {readable}",
+                    parse_mode="Markdown",
+                )
+                context.user_data["current_field_index"] += 1
+                await ask_for_field(update, context)
             return CREATE_USER_FIELD
             
         elif data.startswith("create_traffic_"):
@@ -2673,6 +2807,7 @@ async def finish_create_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "search_type",
             "waiting_for",
             "create_user_description_prefix",
+            "available_internal_squads",
         ):
             context.user_data.pop(key, None)
 
@@ -2987,17 +3122,24 @@ async def confirm_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["action"] = "delete"
         context.user_data["uuid"] = uuid
 
+        username = escape_markdown(str(user.get("username") or "Без имени"))
+        user_uuid = str(user.get("uuid") or uuid)
+        status = str(user.get("status") or "UNKNOWN")
+        used_traffic = format_bytes(user.get("usedTrafficBytes") or 0)
+        expire_at_raw = user.get("expireAt")
+        expire_at = str(expire_at_raw)[:10] if expire_at_raw else "Не указана"
+
         message_lines = [
             "🚨 *ВНИМАНИЕ! УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ* 🚨",
             "",
-            "⚠️ Вы собираетесь **НАВСЕГДА** удалить пользователя:",
-            f"👤 **Имя:** `{escape_markdown(user['username'])}`",
-            f"🆔 **UUID:** `{user['uuid']}`",
-            f"📊 **Статус:** {user['status']}",
-            f"📈 **Использовано трафика:** {format_bytes(user['usedTrafficBytes'])}",
-            f"📅 **Дата истечения:** {user.get('expireAt', 'Не указана')[:10]}",
+            "⚠️ Вы собираетесь НАВСЕГДА удалить пользователя:",
+            f"👤 *Имя:* `{username}`",
+            f"🆔 *UUID:* `{user_uuid}`",
+            f"📊 *Статус:* {status}",
+            f"📈 *Использовано трафика:* {used_traffic}",
+            f"📅 *Дата истечения:* {expire_at}",
             "",
-            "💀 **ЭТО ДЕЙСТВИЕ НЕЛЬЗЯ ОТМЕНИТЬ!**",
+            "💀 *ЭТО ДЕЙСТВИЕ НЕЛЬЗЯ ОТМЕНИТЬ!*",
             "Будут удалены статистика, устройства HWID, история использования и настройки.",
             "",
             "🛡️ Подтвердите удаление кнопкой ниже:"
@@ -3043,8 +3185,11 @@ async def execute_user_deletion(update: Update, context: ContextTypes.DEFAULT_TY
             await update.callback_query.edit_message_text("❌ Ошибка: данные пользователя для удаления не найдены.")
             return USER_MENU
         
-        uuid = user_to_delete['uuid']
-        username = user_to_delete['username']
+        uuid = user_to_delete.get('uuid')
+        username = user_to_delete.get('username', 'Без имени')
+        if not uuid:
+            await update.callback_query.edit_message_text("❌ Ошибка: UUID пользователя не найден.")
+            return USER_MENU
         
         # Show deletion in progress
         await update.callback_query.edit_message_text(
@@ -3189,6 +3334,18 @@ async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFA
         # Сохраняем выбранное поле
         context.user_data["edit_field"] = field
         field_name = USER_FIELDS.get(field, field)
+
+        if field == "activeInternalSquads":
+            current_value = user.get(field) or []
+            selected = []
+            for squad in current_value:
+                if isinstance(squad, dict) and squad.get("uuid"):
+                    selected.append(squad["uuid"])
+                elif isinstance(squad, str):
+                    selected.append(squad)
+            context.user_data["edit_active_internal_squads"] = selected
+            await _show_edit_internal_squads_selector(update, context, user)
+            return EDIT_VALUE
         
         # Показываем текущее значение и запрашиваем новое
         current_value = user[field]
@@ -3308,6 +3465,43 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
 
         # Preset handlers for inline buttons while editing a value
         if user is not None:
+            if data.startswith("edit_squad_toggle_"):
+                squad_uuid = data.replace("edit_squad_toggle_", "", 1)
+                selected = context.user_data.get("edit_active_internal_squads", [])
+                if squad_uuid in selected:
+                    selected = [uuid for uuid in selected if uuid != squad_uuid]
+                else:
+                    selected = [*selected, squad_uuid]
+                context.user_data["edit_active_internal_squads"] = selected
+                await _show_edit_internal_squads_selector(update, context, user)
+                return EDIT_VALUE
+
+            elif data == "edit_squad_done":
+                selected = context.user_data.get("edit_active_internal_squads", [])
+                update_data = {"activeInternalSquads": selected}
+                result = await UserAPI.update_user(user["uuid"], update_data)
+                if result:
+                    context.user_data["edit_user"]["activeInternalSquads"] = [
+                        squad for squad in context.user_data.get("available_internal_squads", [])
+                        if squad.get("uuid") in selected
+                    ]
+                    keyboard = [
+                        [InlineKeyboardButton("👤 К пользователю", callback_data=f"view_{user['uuid']}")],
+                        [InlineKeyboardButton("✏️ Продолжить редактирование", callback_data=f"edit_{user['uuid']}")],
+                        [InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list")],
+                    ]
+                    await query.edit_message_text(
+                        text=f"✅ Внутренние сквады обновлены: {len(selected)} шт.",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                    context.user_data.pop("edit_active_internal_squads", None)
+                    return EDIT_USER
+                await query.edit_message_text(
+                    text="❌ Не удалось обновить внутренние сквады.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=f"edit_{user['uuid']}")]]),
+                )
+                return EDIT_VALUE
+
             if data.startswith("edit_expire_plus_"):
                 try:
                     days = int(data.split("_")[-1])
@@ -3439,9 +3633,11 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
             return await start_edit_user(update, context, uuid)
         elif data.startswith("view_"):
             uuid = data.split("_", 1)[1]
+            context.user_data.pop("edit_active_internal_squads", None)
             await show_user_details(update, context, uuid)
             return SELECTING_USER
         elif data == "back_to_users":
+            context.user_data.pop("edit_active_internal_squads", None)
             await show_users_menu(update, context)
             return USER_MENU
         return EDIT_VALUE
@@ -3576,7 +3772,8 @@ async def handle_cancel_user_creation(update: Update, context: ContextTypes.DEFA
     keys_to_remove = [
         'create_user', 'create_user_fields', 'current_field_index', 
         'using_template', 'template_name', 'selected_template',
-        'search_type', 'waiting_for', 'create_user_description_prefix'
+        'search_type', 'waiting_for', 'create_user_description_prefix',
+        'available_internal_squads'
     ]
     
     for key in keys_to_remove:

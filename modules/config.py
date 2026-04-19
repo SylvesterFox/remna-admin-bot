@@ -121,6 +121,7 @@ USER_FIELDS = {
     'trafficLimitBytes': 'Лимит трафика (в гигабайтах; 0 — безлимит)',
     'trafficLimitStrategy': 'Стратегия сброса трафика (NO_RESET, DAY, WEEK, MONTH)',
     'expireAt': 'Дата истечения (YYYY-MM-DD)',
+    'activeInternalSquads': 'Внутренние сквады',
     'description': 'Описание',
     'telegramId': 'Telegram ID',
     'email': 'Email',
