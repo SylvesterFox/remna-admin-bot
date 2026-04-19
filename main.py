@@ -81,11 +81,38 @@ logger.error("Error logging enabled")
 sys.stdout.flush()
 sys.stderr.flush()
 
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters
+from telegram import Update
+from telegram.ext import Application, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 # Import modules
 from modules.handlers.core.conversation import create_conversation_handler
 from modules import localization  # noqa: F401 - ensure localization patches are loaded
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log unhandled PTB exceptions with enough callback context to debug button issues."""
+    logger.error("Unhandled telegram error", exc_info=context.error)
+
+    if isinstance(update, Update) and update.callback_query:
+        query = update.callback_query
+        logger.error(
+            "Callback query failed: data=%r user_id=%s chat_id=%s message_id=%s",
+            query.data,
+            query.from_user.id if query.from_user else None,
+            query.message.chat_id if query.message else None,
+            query.message.message_id if query.message else None,
+        )
+        try:
+            await query.answer("❌ Ошибка при обработке кнопки", show_alert=True)
+        except Exception:
+            logger.debug("Failed to answer callback query after error", exc_info=True)
+    elif isinstance(update, Update):
+        logger.error(
+            "Update failed: update_id=%s user_id=%s chat_id=%s",
+            update.update_id,
+            update.effective_user.id if update.effective_user else None,
+            update.effective_chat.id if update.effective_chat else None,
+        )
 
 
 def main():
@@ -132,6 +159,7 @@ def main():
     logger.info("Creating conversation handler...")
     conv_handler = create_conversation_handler()
     application.add_handler(conv_handler, group=0)
+    application.add_error_handler(telegram_error_handler)
     logger.info("Conversation handler added successfully")
     
     # Run polling with retry logic
@@ -182,5 +210,4 @@ if __name__ == '__main__':
         pass  # Graceful shutdown
     except Exception as e:
         logger.error(f"Critical error in main: {e}", exc_info=True)
-
 

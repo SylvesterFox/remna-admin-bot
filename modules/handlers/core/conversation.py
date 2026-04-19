@@ -130,6 +130,7 @@ def create_conversation_handler():
             CREATE_USER_FIELD: [
                 CallbackQueryHandler(handle_cancel_user_creation, pattern="^cancel_create$"),
                 CallbackQueryHandler(handle_create_user_input),
+                MessageHandler(filters.StatusUpdate.USER_SHARED, handle_create_user_input),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_create_user_input)
             ],
             BULK_CONFIRM: [
@@ -184,5 +185,3 @@ def create_conversation_handler():
         per_user=True,
         per_message=False
     )
-
-
