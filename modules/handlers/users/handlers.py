@@ -3455,6 +3455,10 @@ async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFA
     elif data == "back_to_users":
         await show_users_menu(update, context)
         return USER_MENU
+
+    elif data == "back_to_list":
+        await list_users(update, context)
+        return SELECTING_USER
     
     return EDIT_USER
 
@@ -3653,6 +3657,10 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
             context.user_data.pop("edit_active_internal_squads", None)
             await show_users_menu(update, context)
             return USER_MENU
+        elif data == "back_to_list":
+            context.user_data.pop("edit_active_internal_squads", None)
+            await list_users(update, context)
+            return SELECTING_USER
         return EDIT_VALUE
 
     field = context.user_data.get("edit_field")
