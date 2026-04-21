@@ -114,6 +114,7 @@ EDIT_HOST, EDIT_HOST_FIELD = range(19, 21)
 # Steps for host creation wizard
 CREATE_HOST, HOST_PROFILE, HOST_INBOUND, HOST_PARAMS = range(27, 31)
 CREATE_NODE, NODE_NAME, NODE_ADDRESS, NODE_PORT, NODE_TLS, SELECT_INBOUNDS = range(21, 27)
+SELF_SERVICE_MENU = 31
 
 # User creation fields
 USER_FIELDS = {
@@ -121,6 +122,7 @@ USER_FIELDS = {
     'trafficLimitBytes': 'Лимит трафика (в гигабайтах; 0 — безлимит)',
     'trafficLimitStrategy': 'Стратегия сброса трафика (NO_RESET, DAY, WEEK, MONTH)',
     'expireAt': 'Дата истечения (YYYY-MM-DD)',
+    'activeInternalSquads': 'Внутренние сквады',
     'description': 'Описание',
     'telegramId': 'Telegram ID',
     'email': 'Email',

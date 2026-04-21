@@ -1,12 +1,23 @@
 from datetime import datetime, timedelta
+from io import BytesIO
 import logging
 import random
 import string
 from typing import Dict, Optional, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    KeyboardButton,
+    KeyboardButtonRequestUser,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import ContextTypes, ConversationHandler
 import re
 import asyncio
+import qrcode
 
 from modules.config import (
     MAIN_MENU, USER_MENU, SELECTING_USER, WAITING_FOR_INPUT, CONFIRM_ACTION,
@@ -99,6 +110,7 @@ class Messages:
     CONFIRM_RESET = "⚠️ Вы уверены, что хотите сбросить трафик пользователя?"
     CONFIRM_REVOKE = "⚠️ Вы уверены, что хотите отозвать подписку пользователя?"
 from modules.api.users import UserAPI
+from modules.api.internal_squads import InternalSquadAPI
 from modules.utils.formatters import format_bytes, format_user_details, format_user_details_safe, escape_markdown, safe_edit_message
 from modules.utils.selection_helpers import SelectionHelper
 from modules.utils.auth import (
@@ -111,6 +123,168 @@ from modules.utils.auth import (
 from modules.handlers.core.start import show_main_menu
 
 logger = logging.getLogger(__name__)
+
+
+def _build_subscription_qr_image(subscription_url: str) -> BytesIO:
+    """Build a QR code image for the provided subscription URL."""
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(subscription_url)
+    qr.make(fit=True)
+
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+async def _send_subscription_qr(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: Dict[str, Any],
+    *,
+    reply_to_message_id: Optional[int] = None,
+) -> bool:
+    """Send subscription URL QR code as a separate photo message."""
+    subscription_url = user.get("subscriptionUrl")
+    if not subscription_url:
+        return False
+
+    qr_buffer = _build_subscription_qr_image(subscription_url)
+    username = user.get("username", "unknown")
+    caption = f"QR подписки для {username}\n{subscription_url}"
+
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=InputFile(qr_buffer, filename=f"subscription-{username}.png"),
+        caption=caption,
+        reply_to_message_id=reply_to_message_id,
+    )
+    return True
+
+
+TELEGRAM_USER_PICKER_REQUEST_ID = 1001
+
+
+async def _send_user_request_keyboard(
+    update: Update,
+    prompt: str = "Нажмите кнопку ниже, чтобы выбрать пользователя в Telegram.",
+) -> None:
+    """Send a one-time reply keyboard that opens Telegram user picker."""
+    keyboard = ReplyKeyboardMarkup(
+        [[
+            KeyboardButton(
+                "👤 Выбрать пользователя",
+                request_user=KeyboardButtonRequestUser(
+                    request_id=TELEGRAM_USER_PICKER_REQUEST_ID,
+                    user_is_bot=False,
+                ),
+            )
+        ]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+    target_message = update.callback_query.message if update.callback_query else update.message
+    if target_message:
+        await target_message.reply_text(prompt, reply_markup=keyboard)
+
+
+async def _show_internal_squads_selector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Render internal squads multi-select step for user creation."""
+    squads = context.user_data.get("available_internal_squads")
+    if squads is None:
+        squads = await InternalSquadAPI.get_all_internal_squads()
+        context.user_data["available_internal_squads"] = squads
+
+    selected = set(context.user_data["create_user"].get("activeInternalSquads", []))
+
+    keyboard = []
+    if squads:
+        for squad in squads:
+            squad_uuid = squad.get("uuid")
+            squad_name = squad.get("name", "Без имени")
+            if not squad_uuid:
+                continue
+            prefix = "✅" if squad_uuid in selected else "⬜"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{prefix} {squad_name}",
+                    callback_data=f"create_squad_toggle_{squad_uuid}",
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="create_squad_done")])
+    else:
+        keyboard.append([InlineKeyboardButton("⏩ Пропустить", callback_data="skip_field")])
+
+    keyboard.append([InlineKeyboardButton("⏩ Пропустить", callback_data="skip_field")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")])
+
+    message = "🛡️ *Выберите внутренние сквады*\n\n"
+    if squads:
+        message += "Можно выбрать несколько сквадов. Нажимайте по пунктам, затем `Готово`."
+    else:
+        message += "Не удалось получить список внутренних сквадов."
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+
+
+async def _show_edit_internal_squads_selector(update: Update, context: ContextTypes.DEFAULT_TYPE, user: Dict[str, Any]):
+    """Render internal squads multi-select step for editing a user."""
+    squads = context.user_data.get("available_internal_squads")
+    if squads is None:
+        squads = await InternalSquadAPI.get_all_internal_squads()
+        context.user_data["available_internal_squads"] = squads
+
+    selected = set(context.user_data.get("edit_active_internal_squads", []))
+
+    keyboard = []
+    if squads:
+        for squad in squads:
+            squad_uuid = squad.get("uuid")
+            squad_name = squad.get("name", "Без имени")
+            if not squad_uuid:
+                continue
+            prefix = "✅" if squad_uuid in selected else "⬜"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{prefix} {squad_name}",
+                    callback_data=f"edit_squad_toggle_{squad_uuid}",
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="edit_squad_done")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔄 Обновить список", callback_data=f"edit_field_activeInternalSquads")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад к выбору поля", callback_data=f"edit_{user['uuid']}")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"view_{user['uuid']}")])
+
+    message = f"📝 *Редактирование поля: Внутренние сквады*\n\n"
+    if squads:
+        message += "Нажимайте по сквадам, чтобы включать и выключать их для пользователя.\n"
+        message += "Когда закончите, нажмите `Готово`."
+    else:
+        message += "Не удалось получить список внутренних сквадов."
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.edit_message_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
 
 # Декоратор для проверки авторизации
 def require_authorization(func):
@@ -998,7 +1172,28 @@ async def show_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         logger.error(f"Error formatting user details (safe): {e}")
         message = f"👤 Пользователь: {user.get('username','')}\n🆔 UUID: {user.get('uuid','')}\n📊 Статус: {user.get('status','')}"
 
-    keyboard = SelectionHelper.create_user_info_keyboard(uuid, action_prefix="user_action", is_admin=context.user_data.get('is_admin', False))
+    keyboard = SelectionHelper.create_user_info_keyboard(
+        uuid,
+        action_prefix="user_action",
+        is_admin=context.user_data.get('is_admin', False),
+    )
+
+    # Safety net: ensure the subscription button is present even if another path rebuilt the markup.
+    has_subscription_button = any(
+        any(button.callback_data == f"user_action_subscription_{uuid}" for button in row)
+        for row in keyboard.inline_keyboard
+    )
+    if not has_subscription_button:
+        rows = list(keyboard.inline_keyboard[:-1])
+        rows.append([InlineKeyboardButton("🔗 URL и QR подписки", callback_data=f"user_action_subscription_{uuid}")])
+        rows.append(list(keyboard.inline_keyboard[-1]))
+        keyboard = InlineKeyboardMarkup(rows)
+
+    logger.info(
+        "User details keyboard for %s contains callbacks: %s",
+        uuid,
+        [button.callback_data for row in keyboard.inline_keyboard for button in row],
+    )
 
     try:
         await update.callback_query.edit_message_text(
@@ -1048,6 +1243,15 @@ async def handle_user_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return await start_edit_user(update, context, uuid)
             elif action == "refresh":
                 await show_user_details(update, context, uuid)
+                return SELECTING_USER
+            elif action == "subscription":
+                user = await user_cache.get_user(uuid)
+                if not user or not user.get("subscriptionUrl"):
+                    await query.answer("У пользователя нет URL подписки", show_alert=True)
+                    return SELECTING_USER
+
+                await _send_subscription_qr(update, context, user)
+                await query.answer("URL и QR подписки отправлены", show_alert=False)
                 return SELECTING_USER
             elif action == "disable":
                 context.user_data["action"] = "disable"
@@ -1757,7 +1961,6 @@ async def ask_for_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Special handling for expireAt
     elif field == "expireAt":
         # Default to 30 days from now
-        default_value = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
         message = f"📅 *Выберите или введите дату истечения*{template_info}\n\n"
         message += "Введите дату в формате YYYY-MM-DD или выберите один из пресетов ниже:"
         
@@ -1770,11 +1973,12 @@ async def ask_for_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("7 дней", callback_data=f"create_date_{(today + timedelta(days=7)).strftime('%Y-%m-%d')}")
             ],
             [
+                InlineKeyboardButton("10 дней", callback_data=f"create_date_{(today + timedelta(days=10)).strftime('%Y-%m-%d')}"),
                 InlineKeyboardButton("30 дней", callback_data=f"create_date_{(today + timedelta(days=30)).strftime('%Y-%m-%d')}"),
-                InlineKeyboardButton("60 дней", callback_data=f"create_date_{(today + timedelta(days=60)).strftime('%Y-%m-%d')}"),
-                InlineKeyboardButton("90 дней", callback_data=f"create_date_{(today + timedelta(days=90)).strftime('%Y-%m-%d')}")
+                InlineKeyboardButton("60 дней", callback_data=f"create_date_{(today + timedelta(days=60)).strftime('%Y-%m-%d')}")
             ],
             [
+                InlineKeyboardButton("90 дней", callback_data=f"create_date_{(today + timedelta(days=90)).strftime('%Y-%m-%d')}"),
                 InlineKeyboardButton("180 дней", callback_data=f"create_date_{(today + timedelta(days=180)).strftime('%Y-%m-%d')}"),
                 InlineKeyboardButton("365 дней", callback_data=f"create_date_{(today + timedelta(days=365)).strftime('%Y-%m-%d')}")
             ],
@@ -1798,6 +2002,10 @@ async def ask_for_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         
+        return CREATE_USER_FIELD
+
+    elif field == "activeInternalSquads":
+        await _show_internal_squads_selector(update, context)
         return CREATE_USER_FIELD
     
     # Special handling for trafficLimitBytes
@@ -1881,6 +2089,33 @@ async def ask_for_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         
+        return CREATE_USER_FIELD
+
+    elif field == "telegramId":
+        message = (
+            f"📱 *Введите Telegram ID*{template_info}\n\n"
+            "Введите ID вручную или выберите пользователя через Telegram-панель."
+        )
+        keyboard = [
+            [InlineKeyboardButton("👤 Выбрать пользователя", callback_data="request_user_for_telegram_id")],
+            [InlineKeyboardButton("⏩ Пропустить", callback_data="skip_field")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                text=message,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+
         return CREATE_USER_FIELD
     
     # Special handling for hwidDeviceLimit
@@ -2014,6 +2249,11 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
         data = query.data
         
         if data == "skip_field":
+            fields = context.user_data.get("create_user_fields", [])
+            index = context.user_data.get("current_field_index", 0)
+            if index < len(fields) and fields[index] == "telegramId" and query.message:
+                await query.message.reply_text("Telegram ID пропущен.", reply_markup=ReplyKeyboardRemove())
+            context.user_data.pop("create_user_description_prefix", None)
             # Skip this field
             context.user_data["current_field_index"] += 1
             await ask_for_field(update, context)
@@ -2025,6 +2265,10 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
         #     return USER_MENU
         
         elif data == "back_to_main":
+            fields = context.user_data.get("create_user_fields", [])
+            index = context.user_data.get("current_field_index", 0)
+            if index < len(fields) and fields[index] == "telegramId" and query.message:
+                await query.message.reply_text("Возвращаемся в главное меню.", reply_markup=ReplyKeyboardRemove())
             # Return to main menu
             await show_main_menu(update, context)
             return MAIN_MENU
@@ -2063,7 +2307,7 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
         
         elif data == "add_optional_fields":
             # Добавляем дополнительные поля
-            optional_fields = ["telegramId", "email", "tag", "expireAt"]
+            optional_fields = ["expireAt", "activeInternalSquads", "telegramId", "email", "tag"]
             current_fields = context.user_data["create_user_fields"]
             # Добавляем поля, которых еще нет
             for field in optional_fields:
@@ -2127,6 +2371,38 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
                         parse_mode="Markdown"
                     )
             
+            return CREATE_USER_FIELD
+
+        elif data.startswith("create_squad_toggle_"):
+            squad_uuid = data.replace("create_squad_toggle_", "", 1)
+            fields = context.user_data["create_user_fields"]
+            index = context.user_data["current_field_index"]
+            field = fields[index]
+
+            if field == "activeInternalSquads":
+                selected = context.user_data["create_user"].get("activeInternalSquads", [])
+                if squad_uuid in selected:
+                    selected = [uuid for uuid in selected if uuid != squad_uuid]
+                else:
+                    selected = [*selected, squad_uuid]
+                context.user_data["create_user"]["activeInternalSquads"] = selected
+                await _show_internal_squads_selector(update, context)
+            return CREATE_USER_FIELD
+
+        elif data == "create_squad_done":
+            fields = context.user_data["create_user_fields"]
+            index = context.user_data["current_field_index"]
+            field = fields[index]
+
+            if field == "activeInternalSquads":
+                selected = context.user_data["create_user"].get("activeInternalSquads", [])
+                readable = f"{len(selected)} шт." if selected else "не выбраны"
+                await query.edit_message_text(
+                    f"✅ Внутренние сквады: {readable}",
+                    parse_mode="Markdown",
+                )
+                context.user_data["current_field_index"] += 1
+                await ask_for_field(update, context)
             return CREATE_USER_FIELD
             
         elif data.startswith("create_traffic_"):
@@ -2197,15 +2473,16 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
                 field = fields[index]
                 
                 if field == "description":
+                    context.user_data["create_user_description_prefix"] = description
                     context.user_data["create_user"][field] = description
                     
-                    # Показываем сообщение о выбранном шаблоне
                     await query.edit_message_text(
-                        f"✅ Выбрано описание: {description}",
+                        (
+                            f"✅ Выбрано описание: {description} (по шаблону)\n\n"
+                            "дополните описание"
+                        ),
                         parse_mode="Markdown"
                     )
-                    
-                    # Переходим к следующему полю
             except Exception as e:
                 logger.error(f"Unexpected error processing description template: {e}", exc_info=True)
                 await query.edit_message_text(
@@ -2215,6 +2492,22 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
                 context.user_data["current_field_index"] += 1
                 await ask_for_field(update, context)
             
+            return CREATE_USER_FIELD
+
+        elif data == "request_user_for_telegram_id":
+            fields = context.user_data["create_user_fields"]
+            index = context.user_data["current_field_index"]
+            field = fields[index]
+
+            if field == "telegramId":
+                await _send_user_request_keyboard(
+                    update,
+                    prompt=(
+                        "Telegram откроет панель выбора пользователя.\n"
+                        "После выбора я подставлю его Telegram ID в подписку."
+                    ),
+                )
+                await query.answer("Появилась кнопка выбора пользователя", show_alert=False)
             return CREATE_USER_FIELD
             
         elif data.startswith("create_device_"):
@@ -2276,12 +2569,13 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
             
             return CREATE_USER_FIELD
 
-    else:  # Text input
+    else:  # Text/user_shared input
         try:
             fields = context.user_data["create_user_fields"]
             index = context.user_data["current_field_index"]
             field = fields[index]
-            value = update.message.text.strip()
+            user_shared = update.message.user_shared
+            value = (update.message.text or "").strip()
             
             # Process the value based on the field
             if field == "username":
@@ -2331,7 +2625,14 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
             
             elif field == "telegramId":
                 try:
-                    value = int(value)
+                    if user_shared:
+                        value = int(user_shared.user_id)
+                    else:
+                        value = int(value)
+                        await update.message.reply_text(
+                            f"✅ Telegram ID сохранен: {value}",
+                            reply_markup=ReplyKeyboardRemove(),
+                        )
                 except ValueError:
                     keyboard = [[InlineKeyboardButton("⏩ Пропустить", callback_data="skip_field")]]
                     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2342,6 +2643,12 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
                         parse_mode="Markdown"
                     )
                     return CREATE_USER_FIELD
+
+                if user_shared:
+                    await update.message.reply_text(
+                        f"✅ Telegram ID выбранного пользователя: {value}",
+                        reply_markup=ReplyKeyboardRemove(),
+                    )
             
             elif field == "tag":
                 if value and not re.match(r"^[A-Z0-9_]{1,16}$", value):
@@ -2388,6 +2695,14 @@ async def handle_create_user_input(update: Update, context: ContextTypes.DEFAULT
                         parse_mode="Markdown"
                     )
                     return CREATE_USER_FIELD
+
+            elif field == "description":
+                description_prefix = context.user_data.pop("create_user_description_prefix", None)
+                if description_prefix:
+                    if value:
+                        value = f"{description_prefix} {value}".strip()
+                    else:
+                        value = description_prefix
             
             # Store the value and move to the next field
             context.user_data["create_user"][field] = value
@@ -2470,6 +2785,7 @@ async def finish_create_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if result:
         keyboard = [
             [InlineKeyboardButton("👁️ Просмотр пользователя", callback_data=f"view_{result['uuid']}")],
+            [InlineKeyboardButton("🔗 URL и QR подписки", callback_data=f"user_action_subscription_{result['uuid']}")],
             [InlineKeyboardButton("🔙 Назад в главное меню", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2483,7 +2799,16 @@ async def finish_create_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if result.get('subscriptionUrl'):
             message += f"\n🔗 URL подписки: `{result['subscriptionUrl']}`\n"
         # Clear creation context now that user is created
-        for key in ("create_user", "create_user_fields", "current_field_index", "using_template", "search_type", "waiting_for"):
+        for key in (
+            "create_user",
+            "create_user_fields",
+            "current_field_index",
+            "using_template",
+            "search_type",
+            "waiting_for",
+            "create_user_description_prefix",
+            "available_internal_squads",
+        ):
             context.user_data.pop(key, None)
 
         
@@ -2493,12 +2818,26 @@ async def finish_create_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
+            if result.get("subscriptionUrl"):
+                await _send_subscription_qr(
+                    update,
+                    context,
+                    result,
+                    reply_to_message_id=update.callback_query.message.message_id,
+                )
         else:
-            await update.message.reply_text(
+            summary_message = await update.message.reply_text(
                 text=message,
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
+            if result.get("subscriptionUrl"):
+                await _send_subscription_qr(
+                    update,
+                    context,
+                    result,
+                    reply_to_message_id=summary_message.message_id,
+                )
         
         return SELECTING_USER
     else:
@@ -2783,17 +3122,24 @@ async def confirm_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["action"] = "delete"
         context.user_data["uuid"] = uuid
 
+        username = escape_markdown(str(user.get("username") or "Без имени"))
+        user_uuid = str(user.get("uuid") or uuid)
+        status = str(user.get("status") or "UNKNOWN")
+        used_traffic = format_bytes(user.get("usedTrafficBytes") or 0)
+        expire_at_raw = user.get("expireAt")
+        expire_at = str(expire_at_raw)[:10] if expire_at_raw else "Не указана"
+
         message_lines = [
             "🚨 *ВНИМАНИЕ! УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ* 🚨",
             "",
-            "⚠️ Вы собираетесь **НАВСЕГДА** удалить пользователя:",
-            f"👤 **Имя:** `{escape_markdown(user['username'])}`",
-            f"🆔 **UUID:** `{user['uuid']}`",
-            f"📊 **Статус:** {user['status']}",
-            f"📈 **Использовано трафика:** {format_bytes(user['usedTrafficBytes'])}",
-            f"📅 **Дата истечения:** {user.get('expireAt', 'Не указана')[:10]}",
+            "⚠️ Вы собираетесь НАВСЕГДА удалить пользователя:",
+            f"👤 *Имя:* `{username}`",
+            f"🆔 *UUID:* `{user_uuid}`",
+            f"📊 *Статус:* {status}",
+            f"📈 *Использовано трафика:* {used_traffic}",
+            f"📅 *Дата истечения:* {expire_at}",
             "",
-            "💀 **ЭТО ДЕЙСТВИЕ НЕЛЬЗЯ ОТМЕНИТЬ!**",
+            "💀 *ЭТО ДЕЙСТВИЕ НЕЛЬЗЯ ОТМЕНИТЬ!*",
             "Будут удалены статистика, устройства HWID, история использования и настройки.",
             "",
             "🛡️ Подтвердите удаление кнопкой ниже:"
@@ -2839,8 +3185,11 @@ async def execute_user_deletion(update: Update, context: ContextTypes.DEFAULT_TY
             await update.callback_query.edit_message_text("❌ Ошибка: данные пользователя для удаления не найдены.")
             return USER_MENU
         
-        uuid = user_to_delete['uuid']
-        username = user_to_delete['username']
+        uuid = user_to_delete.get('uuid')
+        username = user_to_delete.get('username', 'Без имени')
+        if not uuid:
+            await update.callback_query.edit_message_text("❌ Ошибка: UUID пользователя не найден.")
+            return USER_MENU
         
         # Show deletion in progress
         await update.callback_query.edit_message_text(
@@ -2985,6 +3334,18 @@ async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFA
         # Сохраняем выбранное поле
         context.user_data["edit_field"] = field
         field_name = USER_FIELDS.get(field, field)
+
+        if field == "activeInternalSquads":
+            current_value = user.get(field) or []
+            selected = []
+            for squad in current_value:
+                if isinstance(squad, dict) and squad.get("uuid"):
+                    selected.append(squad["uuid"])
+                elif isinstance(squad, str):
+                    selected.append(squad)
+            context.user_data["edit_active_internal_squads"] = selected
+            await _show_edit_internal_squads_selector(update, context, user)
+            return EDIT_VALUE
         
         # Показываем текущее значение и запрашиваем новое
         current_value = user[field]
@@ -3060,6 +3421,11 @@ async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFA
                     InlineKeyboardButton("10", callback_data="edit_devices_10"),
                 ],
             ])
+        elif field == "telegramId":
+            message += "\n\nИли откройте Telegram-панель и выберите пользователя:"
+            preset_keyboard.append([
+                InlineKeyboardButton("👤 Выбрать пользователя", callback_data="edit_request_user_telegram_id"),
+            ])
 
         if preset_keyboard:
             keyboard = preset_keyboard + keyboard
@@ -3089,6 +3455,10 @@ async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFA
     elif data == "back_to_users":
         await show_users_menu(update, context)
         return USER_MENU
+
+    elif data == "back_to_list":
+        await list_users(update, context)
+        return SELECTING_USER
     
     return EDIT_USER
 
@@ -3104,6 +3474,43 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
 
         # Preset handlers for inline buttons while editing a value
         if user is not None:
+            if data.startswith("edit_squad_toggle_"):
+                squad_uuid = data.replace("edit_squad_toggle_", "", 1)
+                selected = context.user_data.get("edit_active_internal_squads", [])
+                if squad_uuid in selected:
+                    selected = [uuid for uuid in selected if uuid != squad_uuid]
+                else:
+                    selected = [*selected, squad_uuid]
+                context.user_data["edit_active_internal_squads"] = selected
+                await _show_edit_internal_squads_selector(update, context, user)
+                return EDIT_VALUE
+
+            elif data == "edit_squad_done":
+                selected = context.user_data.get("edit_active_internal_squads", [])
+                update_data = {"activeInternalSquads": selected}
+                result = await UserAPI.update_user(user["uuid"], update_data)
+                if result:
+                    context.user_data["edit_user"]["activeInternalSquads"] = [
+                        squad for squad in context.user_data.get("available_internal_squads", [])
+                        if squad.get("uuid") in selected
+                    ]
+                    keyboard = [
+                        [InlineKeyboardButton("👤 К пользователю", callback_data=f"view_{user['uuid']}")],
+                        [InlineKeyboardButton("✏️ Продолжить редактирование", callback_data=f"edit_{user['uuid']}")],
+                        [InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list")],
+                    ]
+                    await query.edit_message_text(
+                        text=f"✅ Внутренние сквады обновлены: {len(selected)} шт.",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                    context.user_data.pop("edit_active_internal_squads", None)
+                    return EDIT_USER
+                await query.edit_message_text(
+                    text="❌ Не удалось обновить внутренние сквады.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=f"edit_{user['uuid']}")]]),
+                )
+                return EDIT_VALUE
+
             if data.startswith("edit_expire_plus_"):
                 try:
                     days = int(data.split("_")[-1])
@@ -3227,6 +3634,14 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
                     )
                     return EDIT_VALUE
 
+            elif data == "edit_request_user_telegram_id":
+                if context.user_data.get("edit_field") == "telegramId":
+                    await _send_user_request_keyboard(
+                        update,
+                        "Нажмите кнопку ниже, чтобы выбрать пользователя для поля Telegram ID.",
+                    )
+                return EDIT_VALUE
+
         if data.startswith("edit_"):
             try:
                 uuid = data.split("_", 1)[1]
@@ -3235,11 +3650,17 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
             return await start_edit_user(update, context, uuid)
         elif data.startswith("view_"):
             uuid = data.split("_", 1)[1]
+            context.user_data.pop("edit_active_internal_squads", None)
             await show_user_details(update, context, uuid)
             return SELECTING_USER
         elif data == "back_to_users":
+            context.user_data.pop("edit_active_internal_squads", None)
             await show_users_menu(update, context)
             return USER_MENU
+        elif data == "back_to_list":
+            context.user_data.pop("edit_active_internal_squads", None)
+            await list_users(update, context)
+            return SELECTING_USER
         return EDIT_VALUE
 
     field = context.user_data.get("edit_field")
@@ -3248,8 +3669,17 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
     if not field or not user:
         await update.message.reply_text("❌ Ошибка: данные для редактирования не найдены.")
         return USER_MENU
-    
-    value = update.message.text.strip()
+
+    if update.message.user_shared:
+        if field != "telegramId":
+            await update.message.reply_text(
+                "❌ Выбор пользователя доступен только для поля Telegram ID.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return EDIT_VALUE
+        value = int(update.message.user_shared.user_id)
+    else:
+        value = update.message.text.strip()
     
     # Process the value based on the field
     if field == "expireAt":
@@ -3334,29 +3764,50 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
     result = await UserAPI.update_user(user["uuid"], update_data)
     
     if result:
+        context.user_data["edit_user"][field] = value
         keyboard = [
             [InlineKeyboardButton("👁️ Просмотр пользователя", callback_data=f"view_{user['uuid']}")],
             [InlineKeyboardButton("📝 Продолжить редактирование", callback_data=f"edit_{user['uuid']}")],
             [InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
+        inline_reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.message.user_shared:
+            await update.message.reply_text(
+                f"✅ Поле {field} успешно обновлено.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await update.message.reply_text(
+                "Что делаем дальше?",
+                reply_markup=inline_reply_markup,
+            )
+        else:
+            await update.message.reply_text(
             f"✅ Поле {field} успешно обновлено.",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+                reply_markup=inline_reply_markup,
+                parse_mode="Markdown"
+            )
     else:
         keyboard = [
             [InlineKeyboardButton("🔙 Назад", callback_data=f"edit_{user['uuid']}")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            f"❌ Не удалось обновить поле {field}.",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+        inline_reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.message.user_shared:
+            await update.message.reply_text(
+                "❌ Не удалось обновить поле Telegram ID.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await update.message.reply_text(
+                "Можно вернуться назад и попробовать снова.",
+                reply_markup=inline_reply_markup,
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Не удалось обновить поле {field}.",
+                reply_markup=inline_reply_markup,
+                parse_mode="Markdown"
+            )
     
     return EDIT_USER
 
@@ -3365,12 +3816,15 @@ async def handle_cancel_user_creation(update: Update, context: ContextTypes.DEFA
     """Handle cancel user creation"""
     query = update.callback_query
     await query.answer("Создание пользователя отменено")
+    if query.message:
+        await query.message.reply_text("Создание пользователя отменено.", reply_markup=ReplyKeyboardRemove())
     
     # Очищаем контекст создания пользователя
     keys_to_remove = [
         'create_user', 'create_user_fields', 'current_field_index', 
         'using_template', 'template_name', 'selected_template',
-        'search_type', 'waiting_for'
+        'search_type', 'waiting_for', 'create_user_description_prefix',
+        'available_internal_squads'
     ]
     
     for key in keys_to_remove:

@@ -81,11 +81,53 @@ logger.error("Error logging enabled")
 sys.stdout.flush()
 sys.stderr.flush()
 
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters
+from telegram import Update
+from telegram.ext import Application, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 # Import modules
 from modules.handlers.core.conversation import create_conversation_handler
 from modules import localization  # noqa: F401 - ensure localization patches are loaded
+from modules.services.expiry_notifier import expiry_notifier_loop
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log unhandled PTB exceptions with enough callback context to debug button issues."""
+    logger.error("Unhandled telegram error", exc_info=context.error)
+
+    if isinstance(update, Update) and update.callback_query:
+        query = update.callback_query
+        logger.error(
+            "Callback query failed: data=%r user_id=%s chat_id=%s message_id=%s",
+            query.data,
+            query.from_user.id if query.from_user else None,
+            query.message.chat_id if query.message else None,
+            query.message.message_id if query.message else None,
+        )
+        try:
+            await query.answer("❌ Ошибка при обработке кнопки", show_alert=True)
+        except Exception:
+            logger.debug("Failed to answer callback query after error", exc_info=True)
+    elif isinstance(update, Update):
+        logger.error(
+            "Update failed: update_id=%s user_id=%s chat_id=%s",
+            update.update_id,
+            update.effective_user.id if update.effective_user else None,
+            update.effective_chat.id if update.effective_chat else None,
+        )
+
+
+async def post_init(application: Application) -> None:
+    """Start background tasks after bot startup."""
+    application.bot_data["expiry_notifier_task"] = application.create_task(
+        expiry_notifier_loop(application)
+    )
+
+
+async def post_shutdown(application: Application) -> None:
+    """Stop background tasks on shutdown."""
+    task = application.bot_data.pop("expiry_notifier_task", None)
+    if task:
+        task.cancel()
 
 
 def main():
@@ -122,7 +164,13 @@ def main():
         return
     # Create the Application
     logger.info("Creating Telegram Application...")
-    application = Application.builder().token(bot_token).build()
+    application = (
+        Application.builder()
+        .token(bot_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     logger.info("Telegram Application created successfully")
     
     # Cache cleanup will be handled automatically by the cache TTL mechanism
@@ -132,6 +180,7 @@ def main():
     logger.info("Creating conversation handler...")
     conv_handler = create_conversation_handler()
     application.add_handler(conv_handler, group=0)
+    application.add_error_handler(telegram_error_handler)
     logger.info("Conversation handler added successfully")
     
     # Run polling with retry logic
@@ -182,5 +231,3 @@ if __name__ == '__main__':
         pass  # Graceful shutdown
     except Exception as e:
         logger.error(f"Critical error in main: {e}", exc_info=True)
-
-
