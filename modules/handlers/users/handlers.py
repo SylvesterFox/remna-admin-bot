@@ -3421,6 +3421,11 @@ async def handle_edit_field_selection(update: Update, context: ContextTypes.DEFA
                     InlineKeyboardButton("10", callback_data="edit_devices_10"),
                 ],
             ])
+        elif field == "telegramId":
+            message += "\n\nИли откройте Telegram-панель и выберите пользователя:"
+            preset_keyboard.append([
+                InlineKeyboardButton("👤 Выбрать пользователя", callback_data="edit_request_user_telegram_id"),
+            ])
 
         if preset_keyboard:
             keyboard = preset_keyboard + keyboard
@@ -3625,6 +3630,14 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
                     )
                     return EDIT_VALUE
 
+            elif data == "edit_request_user_telegram_id":
+                if context.user_data.get("edit_field") == "telegramId":
+                    await _send_user_request_keyboard(
+                        update,
+                        "Нажмите кнопку ниже, чтобы выбрать пользователя для поля Telegram ID.",
+                    )
+                return EDIT_VALUE
+
         if data.startswith("edit_"):
             try:
                 uuid = data.split("_", 1)[1]
@@ -3648,8 +3661,17 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
     if not field or not user:
         await update.message.reply_text("❌ Ошибка: данные для редактирования не найдены.")
         return USER_MENU
-    
-    value = update.message.text.strip()
+
+    if update.message.user_shared:
+        if field != "telegramId":
+            await update.message.reply_text(
+                "❌ Выбор пользователя доступен только для поля Telegram ID.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return EDIT_VALUE
+        value = int(update.message.user_shared.user_id)
+    else:
+        value = update.message.text.strip()
     
     # Process the value based on the field
     if field == "expireAt":
@@ -3734,29 +3756,50 @@ async def handle_edit_field_value(update: Update, context: ContextTypes.DEFAULT_
     result = await UserAPI.update_user(user["uuid"], update_data)
     
     if result:
+        context.user_data["edit_user"][field] = value
         keyboard = [
             [InlineKeyboardButton("👁️ Просмотр пользователя", callback_data=f"view_{user['uuid']}")],
             [InlineKeyboardButton("📝 Продолжить редактирование", callback_data=f"edit_{user['uuid']}")],
             [InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
+        inline_reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.message.user_shared:
+            await update.message.reply_text(
+                f"✅ Поле {field} успешно обновлено.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await update.message.reply_text(
+                "Что делаем дальше?",
+                reply_markup=inline_reply_markup,
+            )
+        else:
+            await update.message.reply_text(
             f"✅ Поле {field} успешно обновлено.",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+                reply_markup=inline_reply_markup,
+                parse_mode="Markdown"
+            )
     else:
         keyboard = [
             [InlineKeyboardButton("🔙 Назад", callback_data=f"edit_{user['uuid']}")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            f"❌ Не удалось обновить поле {field}.",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+        inline_reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.message.user_shared:
+            await update.message.reply_text(
+                "❌ Не удалось обновить поле Telegram ID.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await update.message.reply_text(
+                "Можно вернуться назад и попробовать снова.",
+                reply_markup=inline_reply_markup,
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Не удалось обновить поле {field}.",
+                reply_markup=inline_reply_markup,
+                parse_mode="Markdown"
+            )
     
     return EDIT_USER
 

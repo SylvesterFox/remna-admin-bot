@@ -131,6 +131,7 @@ def create_conversation_handler():
             ],
             EDIT_VALUE: [
                 CallbackQueryHandler(handle_edit_field_value),
+                MessageHandler(filters.StatusUpdate.USER_SHARED, handle_edit_field_value),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_value)
             ],
             CREATE_USER: [
