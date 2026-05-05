@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from html import escape
 from io import BytesIO
 import logging
 import random
@@ -158,6 +159,40 @@ async def _send_subscription_qr(
         chat_id=update.effective_chat.id,
         photo=InputFile(qr_buffer, filename=f"subscription-{username}.png"),
         caption=caption,
+        reply_to_message_id=reply_to_message_id,
+    )
+    return True
+
+
+async def _send_direct_connection_links(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: Dict[str, Any],
+    *,
+    reply_to_message_id: Optional[int] = None,
+) -> bool:
+    """Send direct vless:// connection links as a separate text message."""
+    username = user.get("username")
+    if not username:
+        return False
+
+    subscription = await UserAPI.get_subscription_by_username(username)
+    links = []
+    if isinstance(subscription, dict) and isinstance(subscription.get("links"), list):
+        links = [str(link).strip() for link in subscription.get("links") if str(link).strip()]
+    if not links:
+        return False
+
+    links_block = "\n".join(escape(link) for link in links)
+    text = (
+        f"🔐 Прямое подключение для {escape(str(username))}\n\n"
+        f"<pre>{links_block}</pre>"
+    )
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        parse_mode="HTML",
         reply_to_message_id=reply_to_message_id,
     )
     return True
@@ -1189,6 +1224,16 @@ async def show_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         rows.append(list(keyboard.inline_keyboard[-1]))
         keyboard = InlineKeyboardMarkup(rows)
 
+    has_direct_button = any(
+        any(button.callback_data == f"user_action_direct_{uuid}" for button in row)
+        for row in keyboard.inline_keyboard
+    )
+    if not has_direct_button:
+        rows = list(keyboard.inline_keyboard[:-1])
+        rows.append([InlineKeyboardButton("🔐 Прямое подключение", callback_data=f"user_action_direct_{uuid}")])
+        rows.append(list(keyboard.inline_keyboard[-1]))
+        keyboard = InlineKeyboardMarkup(rows)
+
     logger.info(
         "User details keyboard for %s contains callbacks: %s",
         uuid,
@@ -1252,6 +1297,24 @@ async def handle_user_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
                 await _send_subscription_qr(update, context, user)
                 await query.answer("URL и QR подписки отправлены", show_alert=False)
+                return SELECTING_USER
+            elif action == "direct":
+                user = await user_cache.get_user(uuid)
+                if not user:
+                    await query.answer("Пользователь не найден", show_alert=True)
+                    return SELECTING_USER
+
+                sent = await _send_direct_connection_links(
+                    update,
+                    context,
+                    user,
+                    reply_to_message_id=query.message.message_id if query.message else None,
+                )
+                if not sent:
+                    await query.answer("Прямые vless:// ключи не найдены", show_alert=True)
+                    return SELECTING_USER
+
+                await query.answer("Прямые ключи отправлены", show_alert=False)
                 return SELECTING_USER
             elif action == "disable":
                 context.user_data["action"] = "disable"
@@ -2933,13 +2996,33 @@ async def show_user_hwid_devices(update: Update, context: ContextTypes.DEFAULT_T
 async def show_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, uuid):
     """Show user statistics"""
     user = context.user_data.get("current_user") or await UserAPI.get_user_by_uuid(uuid)
-    
-    # Get usage for last 30 days
-    end_date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    
-    usage = await UserAPI.get_user_usage_by_range(uuid, start_date, end_date)
-    
+
+    def as_int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def extract_usage_entries(payload):
+        if isinstance(payload, list):
+            return [entry for entry in payload if isinstance(entry, dict)]
+        if isinstance(payload, dict):
+            for key in ("usage", "items", "stats", "result", "entries"):
+                nested = payload.get(key)
+                if isinstance(nested, list):
+                    return [entry for entry in nested if isinstance(entry, dict)]
+        return []
+
+    modern_end_date = datetime.now().strftime("%Y-%m-%d")
+    modern_start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    usage = extract_usage_entries(
+        await UserAPI.get_user_bandwidth_legacy(uuid, modern_start_date, modern_end_date)
+    )
+    if not usage:
+        end_date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        usage = extract_usage_entries(await UserAPI.get_user_usage_by_range(uuid, start_date, end_date))
+
     if not usage:
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f"view_{uuid}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2973,7 +3056,9 @@ async def show_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, uu
         for entry in usage:
             node_uuid = entry.get("nodeUuid")
             node_name = entry.get("nodeName", "Неизвестный сервер")
-            total = entry.get("total", 0)
+            total = as_int(entry.get("total"))
+            if total == 0:
+                total = as_int(entry.get("download")) + as_int(entry.get("upload"))
             
             if node_uuid not in node_usage:
                 node_usage[node_uuid] = {

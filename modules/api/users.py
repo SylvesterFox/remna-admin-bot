@@ -6,6 +6,28 @@ logger = logging.getLogger(__name__)
 
 class UserAPI:
     """API client for user operations"""
+
+    @staticmethod
+    def _normalize_user(user):
+        """Flatten modern Remnawave user payloads for legacy bot code."""
+        if not isinstance(user, dict):
+            return user
+
+        normalized = dict(user)
+        user_traffic = normalized.get("userTraffic")
+        if isinstance(user_traffic, dict):
+            for source_key, target_key in {
+                "usedTrafficBytes": "usedTrafficBytes",
+                "lifetimeUsedTrafficBytes": "lifetimeUsedTrafficBytes",
+                "onlineAt": "onlineAt",
+                "lastConnectedNodeUuid": "lastConnectedNodeUuid",
+                "firstConnectedAt": "firstConnectedAt",
+            }.items():
+                value = user_traffic.get(source_key)
+                if value is not None and normalized.get(target_key) is None:
+                    normalized[target_key] = value
+
+        return normalized
     
     @staticmethod
     async def get_all_users():
@@ -40,7 +62,7 @@ class UserAPI:
                 if not users:
                     break
                 
-                all_users.extend(users)
+                all_users.extend(UserAPI._normalize_user(user) for user in users)
                 
                 # If we got less than requested size, we've reached the end
                 if len(users) < size:
@@ -88,7 +110,7 @@ class UserAPI:
     @staticmethod
     async def get_user_by_uuid(uuid):
         """Get user by UUID"""
-        return await RemnaAPI.get(f"users/{uuid}")
+        return UserAPI._normalize_user(await RemnaAPI.get(f"users/{uuid}"))
     
     @staticmethod
     async def get_user_by_short_uuid(short_uuid):
@@ -104,25 +126,36 @@ class UserAPI:
     @staticmethod
     async def get_user_by_username(username):
         """Get user by username"""
-        return await RemnaAPI.get(f"users/by-username/{username}")
+        return UserAPI._normalize_user(await RemnaAPI.get(f"users/by-username/{username}"))
+
+    @staticmethod
+    async def get_subscription_by_username(username):
+        """Get subscription details, including direct links, by username."""
+        return await RemnaAPI.get(f"subscriptions/by-username/{username}")
     
     @staticmethod
     async def get_user_by_telegram_id(telegram_id):
         """Get user by Telegram ID"""
         result = await RemnaAPI.get(f"users/by-telegram-id/{telegram_id}")
-        return result if result else []
+        if isinstance(result, list):
+            return [UserAPI._normalize_user(user) for user in result]
+        return UserAPI._normalize_user(result) if result else []
     
     @staticmethod
     async def get_user_by_email(email):
         """Get user by email"""
         result = await RemnaAPI.get(f"users/by-email/{email}")
-        return result if result else []
+        if isinstance(result, list):
+            return [UserAPI._normalize_user(user) for user in result]
+        return UserAPI._normalize_user(result) if result else []
     
     @staticmethod
     async def get_user_by_tag(tag):
         """Get user by tag"""
         result = await RemnaAPI.get(f"users/by-tag/{tag}")
-        return result if result else []
+        if isinstance(result, list):
+            return [UserAPI._normalize_user(user) for user in result]
+        return UserAPI._normalize_user(result) if result else []
     
     @staticmethod
     async def create_user(user_data):
@@ -232,6 +265,24 @@ class UserAPI:
             "end": end_date
         }
         return await RemnaAPI.get(f"users/stats/usage/{uuid}/range", params)
+
+    @staticmethod
+    async def get_user_bandwidth_stats(uuid, start_date, end_date):
+        """Get user bandwidth stats from modern Remnawave API."""
+        params = {
+            "start": start_date,
+            "end": end_date,
+        }
+        return await RemnaAPI.get(f"bandwidth-stats/users/{uuid}", params=params)
+
+    @staticmethod
+    async def get_user_bandwidth_legacy(uuid, start_date, end_date):
+        """Get legacy-compatible user bandwidth stats from modern Remnawave API."""
+        params = {
+            "start": start_date,
+            "end": end_date,
+        }
+        return await RemnaAPI.get(f"bandwidth-stats/users/{uuid}/legacy", params=params)
     
     @staticmethod
     async def get_user_hwid_devices(uuid):

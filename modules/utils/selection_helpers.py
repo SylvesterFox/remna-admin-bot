@@ -216,6 +216,7 @@ class SelectionHelper:
             rows.append([InlineKeyboardButton("🔄 Обновить данные", callback_data=f"{action_prefix}_refresh_{user_uuid}")])
 
         rows.append([InlineKeyboardButton("🔗 URL и QR подписки", callback_data=f"{action_prefix}_subscription_{user_uuid}")])
+        rows.append([InlineKeyboardButton("🔐 Прямое подключение", callback_data=f"{action_prefix}_direct_{user_uuid}")])
         rows.append([InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_users")])
         return InlineKeyboardMarkup(rows)
 
