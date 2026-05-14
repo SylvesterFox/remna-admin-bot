@@ -42,7 +42,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Вам недоступен этот бот. Обратитесь к администратору.")
     elif update.callback_query:
         await update.callback_query.answer("⛔ Вам недоступен этот бот. Обратитесь к администратору.", show_alert=True)
-    return MAIN_MENU
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show main menu with system statistics"""
